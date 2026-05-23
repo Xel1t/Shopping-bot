@@ -256,9 +256,9 @@ async def shopping_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     username = get_username(update)
     conn = get_db()
-    c = conn.cursor()
-    conn.execute("INSERT INTO trips (username, date) VALUES (?,?)", (username, datetime.now().isoformat()))
-    trip_id = c.lastrowid
+    cur = conn.cursor()
+    cur.execute("INSERT INTO trips (username, date) VALUES (?,?)", (username, datetime.now().isoformat()))
+    trip_id = cur.lastrowid
     for iid, user, cat, name, qty in items:
         conn.execute("INSERT INTO trip_items (trip_id, category, name, qty) VALUES (?,?,?,?)", (trip_id, cat, name, qty))
     conn.commit(); conn.close()
