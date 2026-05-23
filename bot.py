@@ -1,175 +1,99 @@
 import os
 import sqlite3
-import requests
-import math
 from datetime import datetime, date
-from calendar import monthrange
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 
-DB_PATH = os.environ.get("DB_PATH", "budget.db")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-EXCHANGE_API_KEY = os.environ.get("EXCHANGE_API_KEY", "")
-
-USER1 = os.environ.get("USER1", "tim")
-USER2 = os.environ.get("USER2", "masha")
+DB_PATH = os.environ.get("DB_PATH", "shopping.db")
+BOT_TOKEN = os.environ.get("SHOPPING_BOT_TOKEN", "")
 
 CATEGORIES = [
-    "🛒 Продукты", "🍽 Рестораны", "🛵 Доставка", "☕️ Кофик/Сигареты",
-    "💪 Спорт", "🏥 Страховка", "🏠 Дом",
-    "👗 Одежда", "📦 Онлайн-покупки", "🎁 Подарки", "📝 Другое",
+    ("🥦 Продукты",        "продукты"),
+    ("🏠 Товары для дома", "дом"),
+    ("💊 Аптека",          "аптека"),
+    ("📦 Другое",          "другое"),
 ]
-
-WALLETS_DEFAULT = [
-    ("нз_брат",    "НЗ у брата",       "$",  6000.0),
-    ("крипто_хол", "Крипто холодный",  "$",  3000.0),
-    ("крипто_теп", "Крипто тёплый",    "$",  1500.0),
-    ("оборот",     "В обороте",        "$",  4000.0),
-    ("нал_usd",    "Наличка $",        "$",  0.0),
-    ("нал_eur",    "Наличка €",        "€",  0.0),
-]
-
-FIXED_EXPENSES = [
-    ("Аренда квартиры", 1280.0),
-    ("Интернет",          26.0),
-    ("Свет",             100.0),
-    ("Вода",              30.0),
-    ("Спортзал",          35.0),
-]
-FIXED_TOTAL = sum(a for _, a in FIXED_EXPENSES)
-INCOME_USD  = 3700.0
 
 (
     MAIN_MENU,
-    ADD_CATEGORY, ADD_AMOUNT, ADD_DESC,
-    DEBT_WHO, DEBT_AMOUNT_S, DEBT_CURRENCY, DEBT_DESC_S,
-    WALLET_CHOOSE, WALLET_OP, WALLET_AMOUNT_S,
-) = range(11)
+    ADD_CATEGORY, ADD_ITEM, ADD_QTY,
+) = range(4)
+
+MENU_PATTERN = "^(➕ Добавить|📋 Список|🛒 Иду в магазин|📜 История)$"
 
 
 # ── Keyboards ─────────────────────────────────────────────────
 def main_kb():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("💸 Добавить трату"),  KeyboardButton("📊 Обзор")],
-        [KeyboardButton("🏦 Накопления"),       KeyboardButton("📈 Аналитика")],
-        [KeyboardButton("🤝 Долги"),            KeyboardButton("📜 История")],
-        [KeyboardButton("🏠 Фикс. расходы"),   KeyboardButton("⚙️ Кошелёк")],
+        [KeyboardButton("➕ Добавить"),      KeyboardButton("📋 Список")],
+        [KeyboardButton("🛒 Иду в магазин"), KeyboardButton("📜 История")],
     ], resize_keyboard=True)
 
 def back_kb():
     return ReplyKeyboardMarkup([[KeyboardButton("🔙 Главное меню")]], resize_keyboard=True)
 
+def category_kb():
+    buttons = [[InlineKeyboardButton(label, callback_data=f"cat:{key}")] for label, key in CATEGORIES]
+    return InlineKeyboardMarkup(buttons)
+
+def after_add_kb(category: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Ещё в эту категорию", callback_data=f"more:{category}")],
+        [InlineKeyboardButton("📂 Другая категория",    callback_data="cat_new")],
+        [InlineKeyboardButton("🏠 В меню",              callback_data="go_home")],
+    ])
+
 
 # ── DB ────────────────────────────────────────────────────────
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS expenses (
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS items (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT, amount_eur REAL,
-        category TEXT, description TEXT, date TEXT
+        username TEXT, category TEXT, name TEXT,
+        qty TEXT, added_date TEXT, done INTEGER DEFAULT 0
     )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS debts (
+    c.execute('''CREATE TABLE IF NOT EXISTS trips (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        from_user TEXT, amount REAL, currency TEXT,
-        description TEXT, date TEXT, settled INTEGER DEFAULT 0
+        username TEXT, date TEXT
     )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS wallets (
-        key TEXT PRIMARY KEY, label TEXT, currency TEXT, amount REAL
+    c.execute('''CREATE TABLE IF NOT EXISTS trip_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        trip_id INTEGER, category TEXT, name TEXT,
+        qty TEXT, taken INTEGER DEFAULT 0
     )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS exchange_cache (
-        pair TEXT PRIMARY KEY, rate REAL, updated TEXT
-    )''')
-    for key, label, cur, amount in WALLETS_DEFAULT:
-        cur.execute("INSERT OR IGNORE INTO wallets VALUES (?,?,?,?)", (key, label, cur, amount))
     conn.commit()
     conn.close()
 
 def get_db():
     return sqlite3.connect(DB_PATH)
 
-
-# ── Exchange ──────────────────────────────────────────────────
-def get_usd_to_eur() -> float:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT rate, updated FROM exchange_cache WHERE pair='USD_EUR'")
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        if (datetime.now() - datetime.fromisoformat(row[1])).seconds < 3600:
-            return row[0]
-    try:
-        if EXCHANGE_API_KEY:
-            r = requests.get(f"https://v6.exchangerate-api.com/v6/{EXCHANGE_API_KEY}/pair/USD/EUR", timeout=5).json()
-            rate = r["conversion_rate"]
-        else:
-            r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=5).json()
-            rate = r["rates"]["EUR"]
-        conn = get_db()
-        conn.execute("INSERT OR REPLACE INTO exchange_cache VALUES ('USD_EUR',?,?)",
-                     (rate, datetime.now().isoformat()))
-        conn.commit()
-        conn.close()
-        return rate
-    except Exception:
-        return 0.92
-
-def usd_to_eur(usd): return round(usd * get_usd_to_eur(), 2)
-def c(x): return math.ceil(x)  # always round up for display
-def eur_to_usd(eur):
-    r = get_usd_to_eur()
-    return round(eur / r, 2) if r else round(eur / 0.92, 2)
-
 def get_username(update: Update) -> str:
-    return (update.effective_user.username or update.effective_user.first_name or "unknown").lower()
+    return (update.effective_user.username or update.effective_user.first_name or "кто-то").lower()
 
-def month_expenses_eur() -> float:
-    today = date.today()
+def get_active_items():
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT SUM(amount_eur) FROM expenses WHERE date LIKE ?", (f"{today.year}-{today.month:02d}%",))
-    row = cur.fetchone(); conn.close()
-    return row[0] or 0.0
+    c = conn.cursor()
+    c.execute("SELECT id, username, category, name, qty FROM items WHERE done=0 ORDER BY category, id")
+    rows = c.fetchall(); conn.close()
+    return rows
 
-def month_expenses_by(year: int, month: int) -> float:
+def cat_label(key: str) -> str:
+    for label, k in CATEGORIES:
+        if k == key: return label
+    return key
+
+def save_item(ctx, username):
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT SUM(amount_eur) FROM expenses WHERE date LIKE ?", (f"{year}-{month:02d}%",))
-    row = cur.fetchone(); conn.close()
-    return row[0] or 0.0
-
-def month_by_category_for(year: int, month: int) -> dict:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT category, SUM(amount_eur) FROM expenses WHERE date LIKE ? GROUP BY category",
-              (f"{year}-{month:02d}%",))
-    rows = cur.fetchall(); conn.close()
-    return {r[0]: r[1] for r in rows}
-
-def total_savings_usd() -> float:
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT currency, amount FROM wallets")
-    rows = cur.fetchall(); conn.close()
-    total = 0.0
-    for cur, amt in rows:
-        total += amt if cur == "$" else eur_to_usd(amt)
-    return round(total, 2)
-
-def month_name_ru(month: int) -> str:
-    names = ["Январь","Февраль","Март","Апрель","Май","Июнь",
-             "Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"]
-    return names[month - 1]
-
-def prev_month(year, month):
-    return (year - 1, 12) if month == 1 else (year, month - 1)
-
-def next_month(year, month):
-    return (year + 1, 1) if month == 12 else (year, month + 1)
+    conn.execute(
+        "INSERT INTO items (username, category, name, qty, added_date) VALUES (?,?,?,?,?)",
+        (username, ctx.user_data["category"], ctx.user_data["item_name"],
+         ctx.user_data.get("qty", ""), date.today().isoformat())
+    )
+    conn.commit(); conn.close()
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -177,42 +101,49 @@ async def go_home(update: Update, text="🏠 Главное меню"):
     await update.message.reply_text(text, reply_markup=main_kb())
 
 async def is_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
-    if update.message.text == "🔙 Главное меню":
+    if update.message.text in ("🔙 Главное меню",):
         ctx.user_data.clear()
         await go_home(update)
         return True
     return False
 
+async def is_menu_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """If user tapped a main menu button mid-flow, handle it and return state."""
+    text = update.message.text
+    if text == "➕ Добавить":        return await add_start(update, ctx)
+    elif text == "📋 Список":        await show_list(update, ctx); return MAIN_MENU
+    elif text == "🛒 Иду в магазин": return await shopping_start(update, ctx)
+    elif text == "📜 История":       await show_history(update, ctx); return MAIN_MENU
+    elif text == "🔙 Главное меню":
+        ctx.user_data.clear()
+        await go_home(update); return MAIN_MENU
+    return None
+
 
 # ── /start ────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *Привет! Я ваш семейный бюджет-бот.*\n\nВыбери действие:",
-        reply_markup=main_kb(), parse_mode="Markdown"
+    items = get_active_items()
+    count = len(items)
+    text = (
+        "🛒 *Список покупок*\n\n"
+        f"{'📋 В списке: *' + str(count) + ' товаров*' if count else '📭 Список пуст — добавь первый товар!'}"
     )
+    await update.message.reply_text(text, reply_markup=main_kb(), parse_mode="Markdown")
     return MAIN_MENU
 
 
 # ── Router ────────────────────────────────────────────────────
 async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    if text == "💸 Добавить трату":   return await add_start(update, ctx)
-    elif text == "📊 Обзор":          await show_overview(update, ctx)
-    elif text == "🏦 Накопления":     await show_savings(update, ctx)
-    elif text == "📈 Аналитика":      await show_analytics(update, ctx)
-    elif text == "🤝 Долги":          await show_debts_menu(update, ctx)
-    elif text == "📜 История":        await show_history(update, ctx)
-    elif text == "🏠 Фикс. расходы":  await show_fixed(update, ctx)
-    elif text == "⚙️ Кошелёк":        return await wallet_start(update, ctx)
-    return MAIN_MENU
+    result = await is_menu_button(update, ctx)
+    return result if result is not None else MAIN_MENU
 
 
-# ── Добавить трату ────────────────────────────────────────────
+# ── Добавить товар ────────────────────────────────────────────
 async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(cat, callback_data=f"cat:{cat}")] for cat in CATEGORIES]
+    ctx.user_data.clear()
     await update.message.reply_text(
         "📂 *Выбери категорию:*",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        reply_markup=category_kb(), parse_mode="Markdown"
     )
     await update.message.reply_text("Или назад:", reply_markup=back_kb())
     return ADD_CATEGORY
@@ -221,419 +152,281 @@ async def add_category_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     ctx.user_data["category"] = query.data.replace("cat:", "")
-    await query.edit_message_text(
-        f"✅ *{ctx.user_data['category']}*\n\n"
-        "💶 Введи сумму в €\n_(или `40 USD` для автоконвертации)_",
-        parse_mode="Markdown"
-    )
-    return ADD_AMOUNT
+    await query.edit_message_text(f"✅ {cat_label(ctx.user_data['category'])}\n\n📝 Что купить?")
+    return ADD_ITEM
 
-async def add_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await is_back(update, ctx): return MAIN_MENU
-    parts = update.message.text.strip().split()
-    try:
-        raw = float(parts[0].replace(",", "."))
-        currency = parts[1].upper() if len(parts) > 1 else "EUR"
-        if currency in ("USD", "$"):
-            eur = usd_to_eur(raw)
-            note = f" _(${raw} → €{eur} по курсу)_"
-        else:
-            eur = raw; note = ""
-        ctx.user_data["amount_eur"] = eur
-        ctx.user_data["amount_note"] = note
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Пример: `350` или `40 USD`", parse_mode="Markdown")
-        return ADD_AMOUNT
+async def add_item(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    result = await is_menu_button(update, ctx)
+    if result is not None: return result
+    ctx.user_data["item_name"] = update.message.text.strip()
     await update.message.reply_text(
-        f"💶 *€{eur}*{note}\n\n📝 Комментарий _(или `-` пропустить)_",
+        f"✅ *{ctx.user_data['item_name']}*\n\n"
+        "📦 Количество или уточнение?\n"
+        "_(например: `2 пачки`, `большая`, `х6` — или `-` пропустить)_",
         parse_mode="Markdown", reply_markup=back_kb()
     )
-    return ADD_DESC
+    return ADD_QTY
 
-async def add_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await is_back(update, ctx): return MAIN_MENU
-    desc = update.message.text.strip()
-    if desc == "-": desc = ""
+async def add_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    result = await is_menu_button(update, ctx)
+    if result is not None: return result
+    qty = update.message.text.strip()
+    if qty == "-": qty = ""
+    ctx.user_data["qty"] = qty
     username = get_username(update)
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO expenses (username, amount_eur, category, description, date) VALUES (?,?,?,?,?)",
-        (username, ctx.user_data["amount_eur"], ctx.user_data["category"], desc, date.today().isoformat())
-    )
-    conn.commit(); conn.close()
-    spent = month_expenses_eur()
-    left = usd_to_eur(INCOME_USD) - FIXED_TOTAL - spent
+    save_item(ctx, username)
+    items = get_active_items()
+    label = cat_label(ctx.user_data["category"])
+    qty_text = f" — _{qty}_" if qty else ""
+    category = ctx.user_data["category"]
     await update.message.reply_text(
-        f"✅ *Записано!*\n"
-        f"👤 @{username}  |  {ctx.user_data['category']}\n"
-        f"💶 €{ctx.user_data['amount_eur']}{ctx.user_data.get('amount_note','')}"
-        + (f"\n📝 _{desc}_" if desc else "") +
-        f"\n\n📊 Потрачено: *€{c(spent)}*\n"
-        f"{'🟢' if left > 0 else '🔴'} Остаток: *€{c(left)}*",
-        parse_mode="Markdown", reply_markup=main_kb()
+        f"✅ Добавлено в *{label}*:\n"
+        f"• {ctx.user_data['item_name']}{qty_text}\n\n"
+        f"📋 Всего в списке: *{len(items)} товаров*\n\n"
+        "Добавить ещё?",
+        parse_mode="Markdown",
+        reply_markup=after_add_kb(category)
     )
-    ctx.user_data.clear()
+    return ADD_QTY
+
+
+# ── Callbacks после добавления ────────────────────────────────
+async def after_add_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "go_home":
+        ctx.user_data.clear()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await ctx.bot.send_message(query.message.chat_id, "🏠 Главное меню", reply_markup=main_kb())
+        return MAIN_MENU
+
+    elif data == "cat_new":
+        ctx.user_data.clear()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await ctx.bot.send_message(
+            query.message.chat_id, "📂 *Выбери категорию:*",
+            reply_markup=category_kb(), parse_mode="Markdown"
+        )
+        return ADD_CATEGORY
+
+    elif data.startswith("more:"):
+        cat = data.replace("more:", "")
+        ctx.user_data["category"] = cat
+        ctx.user_data.pop("item_name", None)
+        ctx.user_data.pop("qty", None)
+        await query.edit_message_reply_markup(reply_markup=None)
+        await ctx.bot.send_message(
+            query.message.chat_id,
+            f"📝 Что ещё купить в *{cat_label(cat)}*?",
+            parse_mode="Markdown"
+        )
+        return ADD_ITEM
+
     return MAIN_MENU
 
 
-# ── Обзор ─────────────────────────────────────────────────────
-async def show_overview(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rate = get_usd_to_eur()
-    income_eur = usd_to_eur(INCOME_USD)
-    spent = month_expenses_eur()
-    left = income_eur - FIXED_TOTAL - spent
-    today = date.today()
-    days_left = monthrange(today.year, today.month)[1] - today.day
-    daily = left / days_left if days_left > 0 else 0
-    sav_usd = total_savings_usd()
+# ── Показать список ───────────────────────────────────────────
+async def show_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    items = get_active_items()
+    if not items:
+        await update.message.reply_text("📭 Список пуст!", reply_markup=main_kb())
+        return
+    grouped = {}
+    for iid, user, cat, name, qty in items:
+        grouped.setdefault(cat, []).append((iid, user, name, qty))
+    lines = ["📋 *Список покупок:*\n"]
+    for cat, cat_items in grouped.items():
+        lines.append(f"{cat_label(cat)}")
+        for iid, user, name, qty in cat_items:
+            qty_text = f" — {qty}" if qty else ""
+            lines.append(f"  • {name}{qty_text}  _(@{user})_")
+        lines.append("")
+    lines.append(f"*Итого: {len(items)} товаров*")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
+
+
+# ── Поход в магазин ───────────────────────────────────────────
+async def shopping_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    items = get_active_items()
+    if not items:
+        await update.message.reply_text("📭 Список пуст!", reply_markup=main_kb())
+        return MAIN_MENU
+
+    username = get_username(update)
+    conn = get_db()
+    c = conn.cursor()
+    conn.execute("INSERT INTO trips (username, date) VALUES (?,?)", (username, datetime.now().isoformat()))
+    trip_id = c.lastrowid
+    for iid, user, cat, name, qty in items:
+        conn.execute("INSERT INTO trip_items (trip_id, category, name, qty) VALUES (?,?,?,?)", (trip_id, cat, name, qty))
+    conn.commit(); conn.close()
+
     await update.message.reply_text(
-        f"📊 *Обзор — {today.strftime('%B %Y')}*\n"
-        f"💱 1 USD = {rate:.4f} EUR\n\n"
-        f"💵 Зарплата: ${INCOME_USD:,.0f} → *€{income_eur:,.0f}*\n"
-        f"🏠 Фикс. расходы: *€{FIXED_TOTAL:,.0f}*\n"
-        f"🛒 Потрачено: *€{spent:,.0f}*\n"
-        f"{'🟢' if left > 0 else '🔴'} Остаток: *€{left:,.0f}*\n"
-        f"📅 До конца месяца: {days_left} дн. → *€{c(daily)}/день*\n\n"
-        f"🏦 Накопления: *${sav_usd:,.0f}* ≈ *€{usd_to_eur(sav_usd):,.0f}*",
+        f"🛒 *Поход в магазин!*\n@{username} пошёл за покупками\n\nОтмечай что взял:",
         parse_mode="Markdown", reply_markup=main_kb()
     )
+    await send_shopping_list(ctx, trip_id, chat_id=update.message.chat_id)
+    return MAIN_MENU
 
-
-# ── Накопления ────────────────────────────────────────────────
-async def show_savings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def send_shopping_list(ctx, trip_id: int, chat_id: int):
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT key, label, currency, amount FROM wallets")
-    rows = cur.fetchall(); conn.close()
-    rate = get_usd_to_eur()
-    lines = ["🏦 *Накопления по кошелькам:*\n"]
-    total_usd = 0.0
-    for _, label, cur, amt in rows:
-        if cur == "$":
-            equiv = f"≈ €{usd_to_eur(amt):,.0f}"
-            total_usd += amt
-        else:
-            equiv = f"≈ ${eur_to_usd(amt):,.0f}"
-            total_usd += eur_to_usd(amt)
-        lines.append(f"• {label}: *{cur}{amt:,.0f}*  {equiv}")
-    lines.append(f"\n💰 *Всего: ~${total_usd:,.0f}* ≈ *€{usd_to_eur(total_usd):,.0f}*")
-    lines.append(f"💱 Курс: 1 USD = {rate:.4f} EUR")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
+    c = conn.cursor()
+    c.execute("SELECT id, category, name, qty, taken FROM trip_items WHERE trip_id=? ORDER BY category, id", (trip_id,))
+    rows = c.fetchall(); conn.close()
+
+    grouped = {}
+    for iid, cat, name, qty, taken in rows:
+        grouped.setdefault(cat, []).append((iid, name, qty, taken))
+
+    keyboard = []
+    for cat, cat_items in grouped.items():
+        keyboard.append([InlineKeyboardButton(f"── {cat_label(cat)} ──", callback_data="noop")])
+        for iid, name, qty, taken in cat_items:
+            qty_text = f" {qty}" if qty else ""
+            label = f"✅ {name}{qty_text}" if taken else f"◻️ {name}{qty_text}"
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"toggle:{iid}:{trip_id}")])
+
+    taken_count = sum(1 for row in rows if row[4])
+    keyboard.append([InlineKeyboardButton(
+        f"🏁 Поход завершён ({taken_count}/{len(rows)})",
+        callback_data=f"finish:{trip_id}"
+    )])
+    await ctx.bot.send_message(
+        chat_id, f"🛒 *Список* — {taken_count}/{len(rows)} взято",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def shopping_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "noop": return
+
+    if data.startswith("toggle:"):
+        _, item_id, trip_id = data.split(":")
+        item_id, trip_id = int(item_id), int(trip_id)
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT taken FROM trip_items WHERE id=?", (item_id,))
+        row = c.fetchone()
+        if row:
+            conn.execute("UPDATE trip_items SET taken=? WHERE id=?", (0 if row[0] else 1, item_id))
+            conn.commit()
+        conn.close()
+
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT id, category, name, qty, taken FROM trip_items WHERE trip_id=? ORDER BY category, id", (trip_id,))
+        rows = c.fetchall(); conn.close()
+
+        grouped = {}
+        for iid, cat, name, qty, taken in rows:
+            grouped.setdefault(cat, []).append((iid, name, qty, taken))
+        keyboard = []
+        for cat, cat_items in grouped.items():
+            keyboard.append([InlineKeyboardButton(f"── {cat_label(cat)} ──", callback_data="noop")])
+            for iid, name, qty, taken in cat_items:
+                qty_text = f" {qty}" if qty else ""
+                label = f"✅ {name}{qty_text}" if taken else f"◻️ {name}{qty_text}"
+                keyboard.append([InlineKeyboardButton(label, callback_data=f"toggle:{iid}:{trip_id}")])
+        taken_count = sum(1 for row in rows if row[4])
+        keyboard.append([InlineKeyboardButton(
+            f"🏁 Поход завершён ({taken_count}/{len(rows)})",
+            callback_data=f"finish:{trip_id}"
+        )])
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("finish:"):
+        trip_id = int(data.split(":")[1])
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("SELECT name, category, taken FROM trip_items WHERE trip_id=?", (trip_id,))
+        trip_items = c.fetchall()
+        taken     = [(n, cat) for n, cat, t in trip_items if t == 1]
+        not_taken = [(n, cat) for n, cat, t in trip_items if t == 0]
+        for name, cat in taken:
+            conn.execute("UPDATE items SET done=1 WHERE name=? AND category=? AND done=0", (name, cat))
+        conn.commit(); conn.close()
+
+        lines = ["🏁 *Поход завершён!*\n"]
+        if taken:
+            lines.append(f"✅ Куплено: *{len(taken)}*")
+            for name, cat in taken: lines.append(f"  • {name}")
+        if not_taken:
+            lines.append(f"\n⏳ Осталось: *{len(not_taken)}*")
+            for name, cat in not_taken: lines.append(f"  • {name}")
+        await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
+        await ctx.bot.send_message(query.message.chat_id, "🏠 Возвращайся!", reply_markup=main_kb())
 
 
 # ── История ───────────────────────────────────────────────────
 async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, username, amount_eur, category, description, date FROM expenses ORDER BY id DESC LIMIT 10")
-    rows = cur.fetchall(); conn.close()
+    c = conn.cursor()
+    c.execute("SELECT id, username, date FROM trips ORDER BY id DESC LIMIT 10")
+    trips = c.fetchall(); conn.close()
+    if not trips:
+        await update.message.reply_text("📭 Походов ещё не было.", reply_markup=main_kb())
+        return
+    keyboard = []
+    lines = ["📜 *История походов:*\n"]
+    for tid, user, dt in trips:
+        conn = get_db(); c = conn.cursor()
+        c.execute("SELECT COUNT(*), SUM(taken) FROM trip_items WHERE trip_id=?", (tid,))
+        total, taken = c.fetchone(); conn.close()
+        taken = taken or 0
+        d = dt[:10]
+        lines.append(f"🛒 `{d}` @{user} — {taken}/{total} товаров")
+        keyboard.append([InlineKeyboardButton(f"🛒 {d} — {taken}/{total} товаров", callback_data=f"hist:{tid}")])
+    await update.message.reply_text(
+        "\n".join(lines) + "\n\nНажми на поход чтобы повторить товары:",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def history_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    trip_id = int(query.data.replace("hist:", ""))
+    conn = get_db(); c = conn.cursor()
+    c.execute("SELECT category, name, qty FROM trip_items WHERE trip_id=? AND taken=1", (trip_id,))
+    rows = c.fetchall(); conn.close()
     if not rows:
-        await update.message.reply_text("📭 Записей пока нет.", reply_markup=main_kb())
+        await query.answer("Нет купленных товаров", show_alert=True)
         return
-    await update.message.reply_text("📜 *Последние 10 трат:*\n_нажми 🗑 чтобы удалить_", parse_mode="Markdown", reply_markup=main_kb())
-    for eid, user, amt, cat, desc, dt in rows:
-        try:
-            date_str = dt[5:10] if dt else "??-??"
-            user_str = f"@{user}" if user else "неизвестно"
-            desc_str = f"\n📝 {desc}" if desc else ""
-            text = f"`{date_str}` {cat}\n💶 €{c(amt)}  👤 {user_str}{desc_str}"
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🗑 Удалить", callback_data=f"del_expense:{eid}")
-            ]])
-            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
-        except Exception:
-            continue
-
-async def delete_expense_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    eid = int(query.data.replace("del_expense:", ""))
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT amount_eur, category, description FROM expenses WHERE id=?", (eid,))
-    row = cur.fetchone()
-    if row:
-        conn.execute("DELETE FROM expenses WHERE id=?", (eid,))
-        conn.commit()
-        amt, cat, desc = row
-        await query.edit_message_text(
-            f"🗑 *Удалено:* {cat} — €{c(amt)}" + (f"\n_{desc}_" if desc else ""),
-            parse_mode="Markdown"
-        )
-    else:
-        await query.edit_message_text("❌ Запись не найдена.")
-    conn.close()
-
-
-# ── Фикс расходы ──────────────────────────────────────────────
-async def show_fixed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    lines = ["🏠 *Фиксированные расходы:*\n"]
-    for name, amt in FIXED_EXPENSES:
-        lines.append(f"• {name}: *€{c(amt)}*")
-    lines.append(f"\n💶 *Итого: €{c(FIXED_TOTAL)}/мес*")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
-
-
-# ── Долги ─────────────────────────────────────────────────────
-async def show_debts_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, from_user, amount, currency, description, date FROM debts WHERE settled=0 ORDER BY id DESC")
-    rows = cur.fetchall(); conn.close()
-    sym_map = {"USD": "$", "EUR": "€", "CASH_USD": "$ нал", "CASH_EUR": "€ нал"}
-    keyboard = [[InlineKeyboardButton("➕ Записать долг", callback_data="debt:new")]]
-    if rows:
-        for rid, who, amt, cur, desc, dt in rows:
-            sym = sym_map.get(cur, "")
-            keyboard.append([InlineKeyboardButton(f"#{rid} {who} — {sym}{amt:,.0f} ✅ закрыть", callback_data=f"debt:settle:{rid}")])
-    text = "🤝 *Долги*\n\n"
-    if rows:
-        lines = []
-        for rid, who, amt, cur, desc, dt in rows:
-            sym = sym_map.get(cur, "")
-            lines.append(f"#{rid} | {who} — *{sym}{amt:,.0f}*  `{dt[5:]}`" + (f"\n    _{desc}_" if desc else ""))
-        text += "\n".join(lines)
-    else:
-        text += "✅ Долгов нет!"
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-async def debt_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    if data == "debt:new":
-        await query.edit_message_reply_markup(reply_markup=None)
-        await ctx.bot.send_message(
-            query.message.chat_id,
-            "🤝 *Кто взял деньги?* Введи имя или @username:",
-            parse_mode="Markdown", reply_markup=back_kb()
-        )
-        return DEBT_WHO
-    if data.startswith("debt:settle:"):
-        debt_id = int(data.split(":")[-1])
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT from_user, amount, currency FROM debts WHERE id=? AND settled=0", (debt_id,))
-        row = cur.fetchone()
-        if row:
-            conn.execute("UPDATE debts SET settled=1 WHERE id=?", (debt_id,))
-            conn.commit()
-            sym = {"USD": "$", "EUR": "€", "CASH_USD": "$ нал", "CASH_EUR": "€ нал"}.get(row[2], "")
-            await query.edit_message_text(f"✅ Долг #{debt_id} закрыт!\n{row[0]} вернул {sym}{row[1]:,.0f}")
-        conn.close()
-    return MAIN_MENU
-
-async def debt_who(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await is_back(update, ctx): return MAIN_MENU
-    ctx.user_data["debt_who"] = update.message.text.strip()
-    await update.message.reply_text("💰 Сколько?", reply_markup=back_kb())
-    return DEBT_AMOUNT_S
-
-async def debt_amount_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await is_back(update, ctx): return MAIN_MENU
-    try:
-        ctx.user_data["debt_amount"] = float(update.message.text.strip().replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("❌ Введи число.")
-        return DEBT_AMOUNT_S
-    keyboard = [[
-        InlineKeyboardButton("$ USD",    callback_data="dcur:USD"),
-        InlineKeyboardButton("€ EUR",    callback_data="dcur:EUR"),
-    ],[
-        InlineKeyboardButton("💵 Нал $", callback_data="dcur:CASH_USD"),
-        InlineKeyboardButton("💶 Нал €", callback_data="dcur:CASH_EUR"),
-    ]]
-    await update.message.reply_text("Валюта:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return DEBT_CURRENCY
-
-async def debt_currency_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ctx.user_data["debt_currency"] = query.data.replace("dcur:", "")
-    await query.edit_message_text("📝 Комментарий (или `-` пропустить):")
-    return DEBT_DESC_S
-
-async def debt_desc_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await is_back(update, ctx): return MAIN_MENU
-    desc = update.message.text.strip()
-    if desc == "-": desc = ""
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO debts (from_user, amount, currency, description, date) VALUES (?,?,?,?,?)",
-        (ctx.user_data["debt_who"], ctx.user_data["debt_amount"],
-         ctx.user_data["debt_currency"], desc, date.today().isoformat())
-    )
-    conn.commit(); conn.close()
-    sym = {"USD": "$", "EUR": "€", "CASH_USD": "$ нал", "CASH_EUR": "€ нал"}.get(ctx.user_data["debt_currency"], "")
-    await update.message.reply_text(
-        f"✅ *Записано:* {ctx.user_data['debt_who']} взял *{sym}{ctx.user_data['debt_amount']:,.0f}*"
-        + (f"\n📝 _{desc}_" if desc else ""),
-        parse_mode="Markdown", reply_markup=main_kb()
-    )
-    ctx.user_data.clear()
-    return MAIN_MENU
-
-
-# ── Кошелёк ───────────────────────────────────────────────────
-async def wallet_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT key, label, currency, amount FROM wallets")
-    rows = cur.fetchall(); conn.close()
     keyboard = [
-        [InlineKeyboardButton(f"{label}  {cur}{amt:,.0f}", callback_data=f"wlt:{key}")]
-        for key, label, cur, amt in rows
+        [InlineKeyboardButton(f"{cat_label(cat)} — {name}{' ('+qty+')' if qty else ''}", callback_data=f"readd:{cat}:{name}:{qty or ''}")]
+        for cat, name, qty in rows
     ]
-    await update.message.reply_text(
-        "🏦 *Выбери кошелёк:*",
-        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
-    )
-    await update.message.reply_text("Или назад:", reply_markup=back_kb())
-    return WALLET_CHOOSE
+    keyboard.append([InlineKeyboardButton("✅ Добавить все в список", callback_data=f"readd_all:{trip_id}")])
+    await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
 
-async def wallet_chosen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ctx.user_data["wallet_key"] = query.data.replace("wlt:", "")
-    keyboard = [[
-        InlineKeyboardButton("➕ Пополнить", callback_data="wop:add"),
-        InlineKeyboardButton("➖ Снять",     callback_data="wop:sub"),
-    ],[
-        InlineKeyboardButton("✏️ Установить сумму", callback_data="wop:set")
-    ]]
-    await query.edit_message_text("Что сделать?", reply_markup=InlineKeyboardMarkup(keyboard))
-    return WALLET_OP
-
-async def wallet_op(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ctx.user_data["wallet_op"] = query.data.replace("wop:", "")
-    labels = {"add": "пополнить на", "sub": "снять", "set": "установить"}
-    await query.edit_message_text(f"Введи сумму ({labels[ctx.user_data['wallet_op']]}):")
-    return WALLET_AMOUNT_S
-
-async def wallet_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if await is_back(update, ctx): return MAIN_MENU
-    try:
-        amount = float(update.message.text.strip().replace(",", "."))
-    except ValueError:
-        await update.message.reply_text("❌ Введи число.")
-        return WALLET_AMOUNT_S
-    key = ctx.user_data["wallet_key"]
-    op  = ctx.user_data["wallet_op"]
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT label, currency, amount FROM wallets WHERE key=?", (key,))
-    label, cur, old = cur.fetchone()
-    new = old + amount if op == "add" else (old - amount if op == "sub" else amount)
-    conn.execute("UPDATE wallets SET amount=? WHERE key=?", (new, key))
-    conn.commit(); conn.close()
-    await update.message.reply_text(
-        f"✅ *{label}* обновлён\n{cur}{old:,.0f} → *{cur}{new:,.0f}*",
-        parse_mode="Markdown", reply_markup=main_kb()
-    )
-    ctx.user_data.clear()
-    return MAIN_MENU
-
-
-# ── Аналитика ─────────────────────────────────────────────────
-def analytics_nav_kb(year: int, month: int) -> InlineKeyboardMarkup:
-    py, pm = prev_month(year, month)
-    ny, nm = next_month(year, month)
-    today = date.today()
-    row1 = [InlineKeyboardButton(f"◀️ {month_name_ru(pm)[:3]}", callback_data=f"an_month:{py}:{pm}")]
-    row1.append(InlineKeyboardButton(f"📅 {month_name_ru(month)[:3]} {year}", callback_data="noop"))
-    if (ny, nm) <= (today.year, today.month):
-        row1.append(InlineKeyboardButton(f"{month_name_ru(nm)[:3]} ▶️", callback_data=f"an_month:{ny}:{nm}"))
-    row2 = [
-        InlineKeyboardButton("⚖️ Сравнить с пред.", callback_data=f"an_compare:{year}:{month}"),
-        InlineKeyboardButton("📆 Год", callback_data=f"an_year:{year}"),
-    ]
-    return InlineKeyboardMarkup([row1, row2])
-
-def format_month_stats(year: int, month: int) -> str:
-    cats = month_by_category_for(year, month)
-    income_eur = usd_to_eur(INCOME_USD)
-    total = sum(cats.values()) if cats else 0.0
-    left = income_eur - FIXED_TOTAL - total
-    lines = [f"📈 *{month_name_ru(month)} {year}*\n"]
-    if cats:
-        for cat, amt in sorted(cats.items(), key=lambda x: -x[1]):
-            pct = amt / total * 100
-            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-            lines.append(f"{cat}\n`{bar}` {pct:.0f}%  €{c(amt)}\n")
-        lines.append(f"💶 *Потрачено: €{c(total)}*")
-        lines.append(f"{'🟢' if left > 0 else '🔴'} Остаток: *€{c(left)}*")
-    else:
-        lines.append("📭 Трат нет")
-    return "\n".join(lines)
-
-async def show_analytics(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    today = date.today()
-    text = format_month_stats(today.year, today.month)
-    await update.message.reply_text(
-        text, parse_mode="Markdown",
-        reply_markup=analytics_nav_kb(today.year, today.month)
-    )
-
-async def analytics_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def readd_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-
-    if data == "noop":
-        return
-
-    if data.startswith("an_month:"):
-        _, year, month = data.split(":")
-        year, month = int(year), int(month)
-        await query.edit_message_text(
-            format_month_stats(year, month), parse_mode="Markdown",
-            reply_markup=analytics_nav_kb(year, month)
-        )
-
-    elif data.startswith("an_compare:"):
-        _, year, month = data.split(":")
-        year, month = int(year), int(month)
-        py, pm = prev_month(year, month)
-        cats_cur  = month_by_category_for(year, month)
-        cats_prev = month_by_category_for(py, pm)
-        total_cur  = sum(cats_cur.values())  if cats_cur  else 0.0
-        total_prev = sum(cats_prev.values()) if cats_prev else 0.0
-        diff = total_cur - total_prev
-        all_cats = set(list(cats_cur.keys()) + list(cats_prev.keys()))
-        lines = [f"⚖️ *{month_name_ru(pm)[:3]} vs {month_name_ru(month)[:3]} {year}*\n"]
-        for cat in sorted(all_cats):
-            a = cats_prev.get(cat, 0.0)
-            b = cats_cur.get(cat, 0.0)
-            delta = b - a
-            short = cat.split(" ", 1)[-1][:12]
-            sign = "+" if delta > 0 else ""
-            lines.append(f"`{short:<12}` €{c(a):>5} → €{c(b):>5}  {sign}{c(delta)}")
-        lines.append(f"\n💶 *{month_name_ru(pm)}: €{total_prev:.0f}*")
-        lines.append(f"💶 *{month_name_ru(month)}: €{total_cur:.0f}*")
-        lines.append(f"{'📈' if diff > 0 else '📉'} Разница: *{'+' if diff>0 else ''}{c(diff)} €*")
-        back = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"an_month:{year}:{month}")]])
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=back)
-
-    elif data.startswith("an_year:"):
-        _, year = data.split(":")
-        year = int(year)
-        income_eur = usd_to_eur(INCOME_USD)
-        lines = [f"📆 *Годовой обзор — {year}*\n"]
-        grand = 0.0
-        for m in range(1, 13):
-            total = month_expenses_by(year, m)
-            grand += total
-            if total > 0:
-                saved = income_eur - FIXED_TOTAL - total
-                bar = "█" * min(int(total / 200), 15)
-                lines.append(f"`{month_name_ru(m)[:3]}` `{bar:<15}` €{c(total)}  {'🟢' if saved>0 else '🔴'}€{c(abs(saved))}")
-            else:
-                lines.append(f"`{month_name_ru(m)[:3]}` —")
-        lines.append(f"\n💶 *Итого: €{c(grand)}*  |  Среднее: *€{c(grand/12)}/мес*")
-        back = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"an_month:{year}:{date.today().month}")]])
-        await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=back)
+    if data.startswith("readd_all:"):
+        trip_id = int(data.split(":")[1])
+        conn = get_db(); c = conn.cursor()
+        c.execute("SELECT category, name, qty FROM trip_items WHERE trip_id=? AND taken=1", (trip_id,))
+        rows = c.fetchall()
+        username = get_username(update)
+        for cat, name, qty in rows:
+            conn.execute("INSERT INTO items (username, category, name, qty, added_date) VALUES (?,?,?,?,?)",
+                         (username, cat, name, qty or "", date.today().isoformat()))
+        conn.commit(); conn.close()
+        await query.edit_message_text(f"✅ Добавлено *{len(rows)} товаров* в список!", parse_mode="Markdown")
+    elif data.startswith("readd:"):
+        parts = data.split(":", 3)
+        cat, name, qty = parts[1], parts[2], parts[3] if len(parts) > 3 else ""
+        username = get_username(update)
+        conn = get_db()
+        conn.execute("INSERT INTO items (username, category, name, qty, added_date) VALUES (?,?,?,?,?)",
+                     (username, cat, name, qty, date.today().isoformat()))
+        conn.commit(); conn.close()
+        await query.answer(f"✅ {name} добавлен!", show_alert=False)
 
 
 # ── cancel ────────────────────────────────────────────────────
@@ -648,46 +441,43 @@ def main():
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    menu_pattern = "^(💸 Добавить трату|📊 Обзор|🏦 Накопления|📈 Аналитика|🤝 Долги|📜 История|🏠 Фикс. расходы|⚙️ Кошелёк)$"
-
     conv = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            MessageHandler(filters.Regex(menu_pattern), menu_router),
+            MessageHandler(filters.Regex(MENU_PATTERN), menu_router),
         ],
         states={
-            MAIN_MENU: [MessageHandler(filters.Regex(menu_pattern), menu_router)],
+            MAIN_MENU: [
+                MessageHandler(filters.Regex(MENU_PATTERN), menu_router),
+            ],
             ADD_CATEGORY: [
                 CallbackQueryHandler(add_category_chosen, pattern="^cat:"),
-                MessageHandler(filters.Regex("^🔙 Главное меню$"), cancel),
+                CallbackQueryHandler(after_add_callback, pattern="^(more:|cat_new|go_home)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_item),  # catches back + menu buttons
             ],
-            ADD_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_amount)],
-            ADD_DESC:     [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
-            DEBT_WHO:     [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_who)],
-            DEBT_AMOUNT_S:[MessageHandler(filters.TEXT & ~filters.COMMAND, debt_amount_handler)],
-            DEBT_CURRENCY:[CallbackQueryHandler(debt_currency_handler, pattern="^dcur:")],
-            DEBT_DESC_S:  [MessageHandler(filters.TEXT & ~filters.COMMAND, debt_desc_handler)],
-            WALLET_CHOOSE:[
-                CallbackQueryHandler(wallet_chosen, pattern="^wlt:"),
-                MessageHandler(filters.Regex("^🔙 Главное меню$"), cancel),
+            ADD_ITEM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_item),
             ],
-            WALLET_OP:    [CallbackQueryHandler(wallet_op, pattern="^wop:")],
-            WALLET_AMOUNT_S:[MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_amount)],
+            ADD_QTY: [
+                CallbackQueryHandler(after_add_callback, pattern="^(more:|cat_new|go_home)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_qty),
+            ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
             CommandHandler("start", start),
+            MessageHandler(filters.Regex(MENU_PATTERN), menu_router),
             MessageHandler(filters.Regex("^🔙 Главное меню$"), cancel),
         ],
         allow_reentry=True,
     )
 
-    app.add_handler(CallbackQueryHandler(debt_callback, pattern="^debt:"))
-    app.add_handler(CallbackQueryHandler(analytics_callback, pattern="^(an_month:|an_compare:|an_year:|noop)"))
-    app.add_handler(CallbackQueryHandler(delete_expense_callback, pattern="^del_expense:"))
+    app.add_handler(CallbackQueryHandler(shopping_toggle, pattern="^(toggle:|finish:|noop)"))
+    app.add_handler(CallbackQueryHandler(history_callback, pattern="^hist:"))
+    app.add_handler(CallbackQueryHandler(readd_callback, pattern="^readd"))
     app.add_handler(conv)
 
-    print("🤖 Бот запущен!")
+    print("🛒 Бот списка покупок запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
