@@ -20,8 +20,8 @@ CATEGORIES = [
 (
     MAIN_MENU,
     ADD_CATEGORY, ADD_ITEM, ADD_QTY,
-    SHOPPING_MODE,
-) = range(5)
+    ADD_MORE_ITEM, ADD_MORE_QTY,
+) = range(6)
 
 
 # ── Keyboards ─────────────────────────────────────────────────
@@ -37,6 +37,13 @@ def back_kb():
 def category_kb():
     buttons = [[InlineKeyboardButton(label, callback_data=f"cat:{key}")] for label, key in CATEGORIES]
     return InlineKeyboardMarkup(buttons)
+
+def after_add_kb(category: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Ещё в эту категорию", callback_data=f"more:{category}")],
+        [InlineKeyboardButton("📂 Другая категория",    callback_data="cat_new")],
+        [InlineKeyboardButton("🏠 В меню",              callback_data="go_home")],
+    ])
 
 
 # ── DB ────────────────────────────────────────────────────────
@@ -100,6 +107,16 @@ async def is_back(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
         return True
     return False
 
+def save_item(ctx, username):
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO items (username, category, name, qty, added_date) VALUES (?,?,?,?,?)",
+        (username, ctx.user_data["category"], ctx.user_data["item_name"],
+         ctx.user_data.get("qty", ""), date.today().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
 
 # ── /start ────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -125,6 +142,7 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Добавить товар ────────────────────────────────────────────
 async def add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
     await update.message.reply_text(
         "📂 *Выбери категорию:*",
         reply_markup=category_kb(), parse_mode="Markdown"
@@ -155,53 +173,60 @@ async def add_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await is_back(update, ctx): return MAIN_MENU
     qty = update.message.text.strip()
     if qty == "-": qty = ""
+    ctx.user_data["qty"] = qty
     username = get_username(update)
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO items (username, category, name, qty, added_date) VALUES (?,?,?,?,?)",
-        (username, ctx.user_data["category"], ctx.user_data["item_name"], qty, date.today().isoformat())
-    )
-    conn.commit(); conn.close()
+    save_item(ctx, username)
 
     items = get_active_items()
     label = cat_label(ctx.user_data["category"])
     qty_text = f" — _{qty}_" if qty else ""
+    category = ctx.user_data["category"]
+
     await update.message.reply_text(
         f"✅ Добавлено в *{label}*:\n"
         f"• {ctx.user_data['item_name']}{qty_text}\n\n"
         f"📋 Всего в списке: *{len(items)} товаров*\n\n"
         "Добавить ещё?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Ещё в эту категорию", callback_data=f"more:{ctx.user_data['category']}")],
-            [InlineKeyboardButton("📂 Другая категория",    callback_data="add_new")],
-            [InlineKeyboardButton("🏠 В меню",              callback_data="go_home")],
-        ])
+        reply_markup=after_add_kb(category)
     )
-    ctx.user_data.clear()
-    return MAIN_MENU
+    return ADD_QTY  # stay here waiting for inline button
 
-async def add_more_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+
+# ── Callbacks после добавления (внутри conversation) ──────────
+async def after_add_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+
     if data == "go_home":
+        ctx.user_data.clear()
         await query.edit_message_reply_markup(reply_markup=None)
         await ctx.bot.send_message(query.message.chat_id, "🏠 Главное меню", reply_markup=main_kb())
         return MAIN_MENU
-    elif data == "add_new":
+
+    elif data == "cat_new":
+        ctx.user_data.clear()
         await query.edit_message_reply_markup(reply_markup=None)
         await ctx.bot.send_message(
             query.message.chat_id, "📂 *Выбери категорию:*",
             reply_markup=category_kb(), parse_mode="Markdown"
         )
         return ADD_CATEGORY
+
     elif data.startswith("more:"):
         cat = data.replace("more:", "")
         ctx.user_data["category"] = cat
+        ctx.user_data.pop("item_name", None)
+        ctx.user_data.pop("qty", None)
         await query.edit_message_reply_markup(reply_markup=None)
-        await ctx.bot.send_message(query.message.chat_id, "📝 Что купить?")
+        await ctx.bot.send_message(
+            query.message.chat_id,
+            f"📝 Что ещё купить в *{cat_label(cat)}*?",
+            parse_mode="Markdown"
+        )
         return ADD_ITEM
+
     return MAIN_MENU
 
 
@@ -211,7 +236,6 @@ async def show_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text("📭 Список пуст!", reply_markup=main_kb())
         return
-    # Group by category
     grouped = {}
     for iid, user, cat, name, qty in items:
         grouped.setdefault(cat, []).append((iid, user, name, qty))
@@ -234,12 +258,10 @@ async def shopping_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
 
     username = get_username(update)
-    # Create trip
     conn = get_db()
     c = conn.cursor()
     conn.execute("INSERT INTO trips (username, date) VALUES (?,?)", (username, datetime.now().isoformat()))
     trip_id = c.lastrowid
-    # Copy items to trip
     for iid, user, cat, name, qty in items:
         conn.execute(
             "INSERT INTO trip_items (trip_id, category, name, qty) VALUES (?,?,?,?)",
@@ -249,14 +271,13 @@ async def shopping_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     ctx.user_data["trip_id"] = trip_id
     await update.message.reply_text(
-        f"🛒 *Поход в магазин!*\n@{username} пошёл за покупками\n\n"
-        "Отмечай что взял — нажимай на товар:",
+        f"🛒 *Поход в магазин!*\n@{username} пошёл за покупками\n\nОтмечай что взял:",
         parse_mode="Markdown", reply_markup=back_kb()
     )
-    await send_shopping_list(update, ctx, trip_id, chat_id=update.message.chat_id)
-    return SHOPPING_MODE
+    await send_shopping_list(ctx, trip_id, chat_id=update.message.chat_id)
+    return MAIN_MENU
 
-async def send_shopping_list(update, ctx, trip_id: int, chat_id: int = None):
+async def send_shopping_list(ctx, trip_id: int, chat_id: int):
     conn = get_db()
     c = conn.cursor()
     c.execute("SELECT id, category, name, qty, taken FROM trip_items WHERE trip_id=? ORDER BY category, id", (trip_id,))
@@ -278,16 +299,16 @@ async def send_shopping_list(update, ctx, trip_id: int, chat_id: int = None):
     taken_count = sum(1 for row in rows if row[4])
     total_count = len(rows)
     keyboard.append([InlineKeyboardButton(
-        f"✅ Поход завершён ({taken_count}/{total_count})",
+        f"🏁 Поход завершён ({taken_count}/{total_count})",
         callback_data=f"finish:{trip_id}"
     )])
 
-    text = f"🛒 *Список* — {taken_count}/{total_count} взято"
-    if chat_id:
-        await ctx.bot.send_message(chat_id, text, parse_mode="Markdown",
-                                   reply_markup=InlineKeyboardMarkup(keyboard))
-    else:
-        return text, InlineKeyboardMarkup(keyboard)
+    await ctx.bot.send_message(
+        chat_id,
+        f"🛒 *Список* — {taken_count}/{total_count} взято",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 async def shopping_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -305,19 +326,21 @@ async def shopping_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         c.execute("SELECT taken FROM trip_items WHERE id=?", (item_id,))
         row = c.fetchone()
         if row:
-            new_taken = 0 if row[0] else 1
-            conn.execute("UPDATE trip_items SET taken=? WHERE id=?", (new_taken, item_id))
+            conn.execute("UPDATE trip_items SET taken=? WHERE id=?", (0 if row[0] else 1, item_id))
             conn.commit()
         conn.close()
+
         # Rebuild keyboard
         conn = get_db()
         c = conn.cursor()
         c.execute("SELECT id, category, name, qty, taken FROM trip_items WHERE trip_id=? ORDER BY category, id", (trip_id,))
         rows = c.fetchall()
         conn.close()
+
         grouped = {}
         for iid, cat, name, qty, taken in rows:
             grouped.setdefault(cat, []).append((iid, name, qty, taken))
+
         keyboard = []
         for cat, cat_items in grouped.items():
             keyboard.append([InlineKeyboardButton(f"── {cat_label(cat)} ──", callback_data="noop")])
@@ -325,10 +348,11 @@ async def shopping_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 qty_text = f" {qty}" if qty else ""
                 label = f"✅ {name}{qty_text}" if taken else f"◻️ {name}{qty_text}"
                 keyboard.append([InlineKeyboardButton(label, callback_data=f"toggle:{iid}:{trip_id}")])
+
         taken_count = sum(1 for row in rows if row[4])
         total_count = len(rows)
         keyboard.append([InlineKeyboardButton(
-            f"✅ Поход завершён ({taken_count}/{total_count})",
+            f"🏁 Поход завершён ({taken_count}/{total_count})",
             callback_data=f"finish:{trip_id}"
         )])
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
@@ -337,17 +361,15 @@ async def shopping_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         trip_id = int(data.split(":")[1])
         conn = get_db()
         c = conn.cursor()
-        # Mark taken items as done in main list
         c.execute("SELECT name, category, taken FROM trip_items WHERE trip_id=?", (trip_id,))
         trip_items = c.fetchall()
-        taken = [(n, cat) for n, cat, t in trip_items if t == 1]
+        taken     = [(n, cat) for n, cat, t in trip_items if t == 1]
         not_taken = [(n, cat) for n, cat, t in trip_items if t == 0]
         for name, cat in taken:
             conn.execute("UPDATE items SET done=1 WHERE name=? AND category=? AND done=0", (name, cat))
-        conn.commit()
-        conn.close()
+        conn.commit(); conn.close()
 
-        lines = [f"🏁 *Поход завершён!*\n"]
+        lines = ["🏁 *Поход завершён!*\n"]
         if taken:
             lines.append(f"✅ Куплено: *{len(taken)}*")
             for name, cat in taken:
@@ -358,10 +380,7 @@ async def shopping_toggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"  • {name}")
 
         await query.edit_message_text("\n".join(lines), parse_mode="Markdown")
-        await ctx.bot.send_message(
-            query.message.chat_id,
-            "🏠 Возвращайся!", reply_markup=main_kb()
-        )
+        await ctx.bot.send_message(query.message.chat_id, "🏠 Возвращайся!", reply_markup=main_kb())
 
 
 # ── История ───────────────────────────────────────────────────
@@ -375,8 +394,8 @@ async def show_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Походов ещё не было.", reply_markup=main_kb())
         return
 
-    keyboard = []
     lines = ["📜 *История походов:*\n"]
+    keyboard = []
     for tid, user, dt in trips:
         conn = get_db()
         c = conn.cursor()
@@ -412,7 +431,7 @@ async def history_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [InlineKeyboardButton(
-            f"{'🥦' if cat=='продукты' else '🏠' if cat=='дом' else '💊' if cat=='аптека' else '📦'} {name}{' — '+qty if qty else ''}",
+            f"{cat_label(cat)} — {name}{' ('+qty+')' if qty else ''}",
             callback_data=f"readd:{cat}:{name}:{qty or ''}"
         )]
         for cat, name, qty in rows
@@ -473,15 +492,19 @@ def main():
             MessageHandler(filters.Regex(menu_pattern), menu_router),
         ],
         states={
-            MAIN_MENU: [MessageHandler(filters.Regex(menu_pattern), menu_router)],
+            MAIN_MENU: [
+                MessageHandler(filters.Regex(menu_pattern), menu_router),
+            ],
             ADD_CATEGORY: [
                 CallbackQueryHandler(add_category_chosen, pattern="^cat:"),
                 MessageHandler(filters.Regex("^🔙 Главное меню$"), cancel),
             ],
-            ADD_ITEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_item)],
-            ADD_QTY:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_qty)],
-            SHOPPING_MODE: [
-                MessageHandler(filters.Regex("^🔙 Главное меню$"), cancel),
+            ADD_ITEM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_item),
+            ],
+            ADD_QTY: [
+                CallbackQueryHandler(after_add_callback, pattern="^(more:|cat_new|go_home)"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_qty),
             ],
         },
         fallbacks=[
@@ -493,9 +516,8 @@ def main():
     )
 
     app.add_handler(CallbackQueryHandler(shopping_toggle, pattern="^(toggle:|finish:|noop)"))
-    app.add_handler(CallbackQueryHandler(add_more_callback, pattern="^(more:|add_new|go_home)"))
     app.add_handler(CallbackQueryHandler(history_callback, pattern="^hist:"))
-    app.add_handler(CallbackQueryHandler(readd_callback, pattern="^readd"))
+    app.add_handler(CallbackQueryHandler(readd_callback,   pattern="^readd"))
     app.add_handler(conv)
 
     print("🛒 Бот списка покупок запущен!")
