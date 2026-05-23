@@ -116,15 +116,15 @@ async def btn_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     grouped = {}
     for iid, user, cat, name, qty in items:
         grouped.setdefault(cat, []).append((iid, user, name, qty))
-    lines = ["📋 *Список покупок:*\n"]
+    lines = ["📋 Список покупок:\n"]
     keyboard = []
     for cat, cat_items in grouped.items():
-        lines.append(f"{cat_label(cat)}")
+        lines.append(cat_label(cat))
         for iid, user, name, qty in cat_items:
             qty_text = f" — {qty}" if qty else ""
-            lines.append(f"  • {name}{qty_text}  _(@{user})_")
+            lines.append(f"  • {name}{qty_text}  (@{user})")
         lines.append("")
-    lines.append(f"*Итого: {len(items)} товаров*\n\nНажми 🗑 чтобы удалить товар:")
+    lines.append(f"Итого: {len(items)} товаров")
     for cat, cat_items in grouped.items():
         for iid, user, name, qty in cat_items:
             qty_text = f" {qty}" if qty else ""
@@ -132,10 +132,10 @@ async def btn_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🗑 {name}{qty_text}",
                 callback_data=f"del_item:{iid}"
             )])
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=main_kb())
+    await update.message.reply_text("\n".join(lines), reply_markup=main_kb())
     if keyboard:
         await update.message.reply_text(
-            "Удалить из списка:",
+            "Нажми чтобы удалить:",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
@@ -154,8 +154,8 @@ async def btn_shop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.commit(); conn.close()
 
     await update.message.reply_text(
-        f"🛒 *Поход в магазин!*\n@{username} пошёл за покупками\n\nОтмечай что взял:",
-        parse_mode="Markdown", reply_markup=main_kb()
+        f"🛒 Поход в магазин!\n@{username} пошёл за покупками\n\nОтмечай что взял:",
+        reply_markup=main_kb()
     )
     # Build shopping list inline
     conn = get_db()
@@ -298,10 +298,28 @@ async def del_item_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if row:
         conn.execute("DELETE FROM items WHERE id=?", (item_id,))
         conn.commit()
-        await query.edit_message_text(f"🗑 Удалено: *{row[0]}*", parse_mode="Markdown")
+        deleted_name = row[0]
     else:
         await query.edit_message_text("❌ Не найдено.")
+        conn.close()
+        return
     conn.close()
+
+    # Rebuild delete keyboard with remaining items
+    items = get_active_items()
+    if not items:
+        await query.edit_message_text(f"🗑 {deleted_name} удалён\n\n📭 Список теперь пуст!")
+        return
+
+    keyboard = []
+    for iid, user, cat, name, qty in items:
+        qty_text = f" {qty}" if qty else ""
+        keyboard.append([InlineKeyboardButton(f"🗑 {name}{qty_text}", callback_data=f"del_item:{iid}")])
+
+    await query.edit_message_text(
+        f"🗑 {deleted_name} удалён\n\nОсталось {len(items)} товаров. Удалить ещё?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 # ── Поход: toggle + finish ────────────────────────────────────
